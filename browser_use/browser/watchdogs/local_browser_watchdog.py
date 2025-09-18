@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -153,14 +154,43 @@ class LocalBrowserWatchdog(BaseWatchdog):
 				self._browser_log_paths[process.pid] = log_path
 				_mcp_diag(f'_launch_browser:process pid={process.pid} port={debug_port} log={log_path}')
 
+				cdp_wait_task = asyncio.create_task(self._wait_for_cdp_url(debug_port, timeout=60))
+				process_wait_task = asyncio.create_task(subprocess.wait())
+				pending_tasks = {cdp_wait_task, process_wait_task}
 				try:
-					cdp_url = await self._wait_for_cdp_url(debug_port, timeout=60)
+					done, pending = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+					pending_tasks = pending
+					if cdp_wait_task in done:
+						cdp_url = cdp_wait_task.result()
+						process_wait_task.cancel()
+						with suppress(asyncio.CancelledError):
+							await process_wait_task
+					else:
+						cdp_wait_task.cancel()
+						with suppress(asyncio.CancelledError):
+							await cdp_wait_task
+						exit_code = process_wait_task.result()
+						tail = self._read_browser_log_tail(process.pid)
+						_mcp_diag(
+							f'_launch_browser:process_exit code={exit_code} pid={process.pid} log={log_path} tail={tail}'
+						)
+						await self._cleanup_process(process)
+						self._browser_log_paths.pop(process.pid, None)
+						raise RuntimeError(
+							f'Browser exited before CDP became available (code={exit_code}). '
+							f'Check log at {log_path} for details.'
+						)
 				except TimeoutError as timeout_err:
 					tail = self._read_browser_log_tail(process.pid)
 					_mcp_diag(f'_launch_browser:cdp_timeout port={debug_port} pid={process.pid} log={log_path} tail={tail}')
 					await self._cleanup_process(process)
 					self._browser_log_paths.pop(process.pid, None)
 					raise timeout_err
+				finally:
+					for task in pending_tasks:
+						task.cancel()
+						with suppress(asyncio.CancelledError):
+							await task
 
 				_mcp_diag(f'_launch_browser:cdp_ready port={debug_port} log={log_path}')
 

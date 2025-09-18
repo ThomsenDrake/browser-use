@@ -36,6 +36,7 @@ import logging
 import shutil
 import tempfile
 import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -775,20 +776,40 @@ class BrowserUseServer:
 			default_profile_path = str(Path('~/.config/browseruse/profiles/default').expanduser())
 			profile_data['user_data_dir'] = default_profile_path
 
-		# Create browser profile
-		profile = BrowserProfile(**profile_data)
+		def _should_retry_with_ephemeral_profile(error: Exception) -> bool:
+			message = str(error).lower()
+			return 'profile appears to be in use' in message or 'code=21' in message
 
-		# Create browser session (only assign after successful start)
-		session = BrowserSession(browser_profile=profile)
-		self._record_diag(f'init_browser_session:profile_ready allowed={profile.allowed_domains}')
-		try:
-			await session.start()
-			self._record_diag('init_browser_session:browser_started')
-		except Exception as e:
-			self._record_diag(f'init_browser_session:error {type(e).__name__}: {e}')
-			if temp_user_data_dir:
-				shutil.rmtree(temp_user_data_dir, ignore_errors=True)
-			raise
+		session: BrowserSession | None = None
+		while True:
+			profile = BrowserProfile(**profile_data)
+			session = BrowserSession(browser_profile=profile)
+			self._record_diag(
+				f'init_browser_session:profile_ready allowed={profile.allowed_domains} path={profile.user_data_dir}'
+			)
+			try:
+				await session.start()
+				self._record_diag('init_browser_session:browser_started')
+				break
+			except Exception as e:
+				should_retry = (
+					not use_ephemeral_sessions
+					and temp_user_data_dir is None
+					and _should_retry_with_ephemeral_profile(e)
+				)
+				if should_retry:
+					with suppress(Exception):
+						await session.kill()
+					temp_user_data_dir = tempfile.mkdtemp(prefix='browser-use-mcp-')
+					profile_data['user_data_dir'] = temp_user_data_dir
+					self._record_diag(
+						f'init_browser_session:profile_locked_retry path={temp_user_data_dir}'
+					)
+					continue
+				self._record_diag(f'init_browser_session:error {type(e).__name__}: {e}')
+				if temp_user_data_dir:
+					shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+				raise
 
 		self.browser_session = session
 
