@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal, Self, cast
@@ -45,6 +46,20 @@ from browser_use.utils import _log_pretty_url, is_new_tab_page
 DEFAULT_BROWSER_PROFILE = BrowserProfile()
 
 _LOGGED_UNIQUE_SESSION_IDS = set()  # track unique session IDs that have been logged to make sure we always assign a unique enough id to new sessions and avoid ambiguity in logs
+_DIAG_ENV_KEY = 'BROWSER_USE_MCP_DIAG_LOG'
+
+
+def _mcp_diag(message: str) -> None:
+	path = os.getenv(_DIAG_ENV_KEY)
+	if not path:
+		return
+	try:
+		from datetime import datetime
+		timestamp = datetime.utcnow().isoformat()
+		with open(path, 'a', encoding='utf-8') as fh:
+			fh.write(f'{timestamp}Z | {message}\n')
+	except Exception:
+		pass
 red = '\033[91m'
 reset = '\033[0m'
 
@@ -330,6 +345,7 @@ class BrowserSession(BaseModel):
 	_cached_browser_state_summary: Any = PrivateAttr(default=None)
 	_cached_selector_map: dict[int, EnhancedDOMTreeNode] = PrivateAttr(default_factory=dict)
 	_downloaded_files: list[str] = PrivateAttr(default_factory=list)  # Track files downloaded during this session
+	_last_navigation_url: str | None = PrivateAttr(default=None)
 
 	# Watchdogs
 	_crash_watchdog: Any | None = PrivateAttr(default=None)
@@ -493,21 +509,26 @@ class BrowserSession(BaseModel):
 		# await self.reset()
 
 		# Initialize and attach all watchdogs FIRST so LocalBrowserWatchdog can handle BrowserLaunchEvent
+		_mcp_diag('browser_session:on_start:attach_watchdogs_begin')
 		await self.attach_all_watchdogs()
+		_mcp_diag('browser_session:on_start:attach_watchdogs_done')
 
 		try:
 			# If no CDP URL, launch local browser
 			if not self.cdp_url:
 				if self.is_local:
 					# Launch local browser using event-driven approach
+					_mcp_diag('browser_session:on_start:dispatch_launch_event')
 					launch_event = self.event_bus.dispatch(BrowserLaunchEvent())
 					await launch_event
+					_mcp_diag('browser_session:on_start:launch_event_completed')
 
 					# Get the CDP URL from LocalBrowserWatchdog handler result
 					launch_result: BrowserLaunchResult = cast(
 						BrowserLaunchResult, await launch_event.event_result(raise_if_none=True, raise_if_any=True)
 					)
 					self.browser_profile.cdp_url = launch_result.cdp_url
+					_mcp_diag(f'browser_session:on_start:launch_result cdp={launch_result.cdp_url}')
 				else:
 					raise ValueError('Got BrowserSession(is_local=False) but no cdp_url was provided to connect to!')
 
@@ -516,8 +537,10 @@ class BrowserSession(BaseModel):
 			# Only connect if not already connected
 			if self._cdp_client_root is None:
 				# Setup browser via CDP (for both local and remote cases)
+				_mcp_diag(f'browser_session:on_start:connecting cdp={self.cdp_url}')
 				await self.connect(cdp_url=self.cdp_url)
 				assert self.cdp_client is not None
+				_mcp_diag('browser_session:on_start:cdp_connected')
 
 				# Notify that browser is connected (single place)
 				self.event_bus.dispatch(BrowserConnectedEvent(cdp_url=self.cdp_url))
@@ -525,9 +548,11 @@ class BrowserSession(BaseModel):
 				self.logger.debug('Already connected to CDP, skipping reconnection')
 
 			# Return the CDP URL for other components
+			_mcp_diag('browser_session:on_start:completed')
 			return {'cdp_url': self.cdp_url}
 
 		except Exception as e:
+			_mcp_diag(f'browser_session:on_start:error {type(e).__name__}: {e}')
 			self.event_bus.dispatch(
 				BrowserErrorEvent(
 					error_type='BrowserStartEventError',
@@ -653,6 +678,7 @@ class BrowserSession(BaseModel):
 			await self.event_bus.dispatch(
 				AgentFocusChangedEvent(target_id=target_id, url=event.url)
 			)  # do not await! AgentFocusChangedEvent calls SwitchTabEvent and it will deadlock, dispatch to enqueue and return
+			self._last_navigation_url = event.url
 
 			# Note: These should be handled by dedicated watchdogs:
 			# - Security checks (security_watchdog)
@@ -745,6 +771,8 @@ class BrowserSession(BaseModel):
 	async def on_AgentFocusChangedEvent(self, event: AgentFocusChangedEvent) -> None:
 		"""Handle agent focus change - update focus and clear cache."""
 		self.logger.debug(f'🔄 AgentFocusChangedEvent received: target_id=...{event.target_id[-4:]} url={event.url}')
+		if event.url:
+			self._last_navigation_url = event.url
 
 		# Clear cached DOM state since focus changed
 		# self.logger.debug('🔄 Clearing DOM cache...')
@@ -1495,6 +1523,19 @@ class BrowserSession(BaseModel):
 		event = self.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=new_tab))
 		await event
 		await event.event_result(raise_if_any=True, raise_if_none=False)
+
+	async def wait_for_page_idle(self) -> None:
+		"""Pause until the current page has had time to settle after a navigation."""
+		if not self.agent_focus:
+			return
+
+		minimum_wait = self.browser_profile.minimum_wait_page_load_time or 0.0
+		if minimum_wait > 0:
+			await asyncio.sleep(minimum_wait)
+
+		network_idle_wait = self.browser_profile.wait_for_network_idle_page_load_time or 0.0
+		if network_idle_wait > 0:
+			await asyncio.sleep(network_idle_wait)
 
 	# ========== DOM Helper Methods ==========
 

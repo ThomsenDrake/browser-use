@@ -33,9 +33,13 @@ os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
 import asyncio
 import json
 import logging
+import shutil
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
 logging.basicConfig(
@@ -92,10 +96,30 @@ from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
+from browser_use.llm.base import BaseChatModel
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.tools.service import Tools
 
 logger = logging.getLogger(__name__)
+
+PLACEHOLDER_URL_PREFIXES: tuple[str, ...] = (
+	'about:blank',
+	'chrome://',
+	'edge://',
+	'devtools://',
+	'chrome-error://',
+)
+
+DIAG_LOG_PATH = Path(os.getenv('BROWSER_USE_MCP_DIAG_LOG', Path.home() / '.browser-use-mcp-diag.log'))
+
+try:
+	DIAG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+	DIAG_LOG_PATH.touch(exist_ok=True)
+except Exception:
+	pass
+
+if not os.getenv('BROWSER_USE_MCP_DIAG_LOG'):
+	os.environ['BROWSER_USE_MCP_DIAG_LOG'] = str(DIAG_LOG_PATH)
 
 
 def _ensure_all_loggers_use_stderr():
@@ -194,7 +218,7 @@ class BrowserUseServer:
 		self.agent: Agent | None = None
 		self.browser_session: BrowserSession | None = None
 		self.tools: Tools | None = None
-		self.llm: ChatOpenAI | None = None
+		self.llm: BaseChatModel | None = None
 		self.file_system: FileSystem | None = None
 		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
@@ -204,11 +228,29 @@ class BrowserUseServer:
 		self.session_timeout_minutes = session_timeout_minutes
 		self._cleanup_task: Any = None
 
+		# Serialize tool calls to avoid races within a session
+		self._tool_lock = asyncio.Lock()
+
 		# Setup handlers
 		self._setup_handlers()
 
+	def _record_diag(self, message: str) -> None:
+		"""Append a diagnostic line to the MCP diagnostics log."""
+		try:
+			timestamp = datetime.utcnow().isoformat()
+			DIAG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+			with DIAG_LOG_PATH.open('a', encoding='utf-8') as fh:
+				fh.write(f'{timestamp}Z | {message}\n')
+		except Exception:
+			# Never raise from diagnostics
+			pass
+
 	def _setup_handlers(self):
 		"""Setup MCP server handlers."""
+
+		# Resolve defaults once at setup time
+		llm_defaults = get_default_llm(self.config)
+		default_agent_model = llm_defaults.get('model', 'gpt-4o')
 
 		@self.server.list_tools()
 		async def handle_list_tools() -> list[types.Tool]:
@@ -271,7 +313,7 @@ class BrowserUseServer:
 							'include_screenshot': {
 								'type': 'boolean',
 								'description': 'Whether to include a screenshot of the current page',
-								'default': False,
+								'default': True,
 							}
 						},
 					},
@@ -359,8 +401,8 @@ class BrowserUseServer:
 							},
 							'model': {
 								'type': 'string',
-								'description': 'LLM model to use (e.g., gpt-4o, claude-3-opus-20240229)',
-								'default': 'gpt-4o',
+								'description': 'LLM model to use (e.g., mistral-medium-latest, gpt-4o, claude-3-opus-20240229)',
+								'default': default_agent_model,
 							},
 							'allowed_domains': {
 								'type': 'array',
@@ -420,7 +462,9 @@ class BrowserUseServer:
 			start_time = time.time()
 			error_msg = None
 			try:
-				result = await self._execute_tool(name, arguments or {})
+				# Serialize tool calls to the underlying browser session to avoid races
+				async with self._tool_lock:
+					result = await self._execute_tool(name, arguments or {})
 				return [types.TextContent(type='text', text=result)]
 			except Exception as e:
 				error_msg = str(e)
@@ -447,7 +491,7 @@ class BrowserUseServer:
 			return await self._retry_with_browser_use_agent(
 				task=arguments['task'],
 				max_steps=arguments.get('max_steps', 100),
-				model=arguments.get('model', 'gpt-4o'),
+				model=arguments.get('model'),
 				allowed_domains=arguments.get('allowed_domains', []),
 				use_vision=arguments.get('use_vision', True),
 			)
@@ -503,6 +547,187 @@ class BrowserUseServer:
 
 		return f'Unknown tool: {tool_name}'
 
+	@staticmethod
+	def _filter_dataclass_kwargs(config: dict[str, Any], cls: type[Any]) -> dict[str, Any]:
+		fields = getattr(cls, '__dataclass_fields__', {})
+		kwargs: dict[str, Any] = {}
+		for key in fields:
+			if key == 'model':
+				continue
+			if key in config and config[key] is not None:
+				kwargs[key] = config[key]
+		return kwargs
+
+	@staticmethod
+	def _infer_llm_provider(model_name: str) -> str:
+		name = (model_name or '').lower()
+		if 'claude' in name or 'anthropic' in name:
+			return 'anthropic'
+		if 'mistral' in name:
+			return 'mistral'
+		if 'gemini' in name or 'google' in name:
+			return 'google'
+		if 'deepseek' in name:
+			return 'deepseek'
+		if 'groq' in name:
+			return 'groq'
+		if 'openrouter' in name:
+			return 'openrouter'
+		if 'ollama' in name:
+			return 'ollama'
+		if 'azure' in name:
+			return 'azure'
+		if 'bedrock' in name:
+			return 'aws-bedrock'
+		return 'openai'
+
+	def _create_llm_from_config(
+		self,
+		llm_config: dict[str, Any] | None,
+		model_override: str | None = None,
+	) -> BaseChatModel:
+		config = dict(llm_config or {})
+		for meta_key in ('id', 'default', 'created_at'):
+			config.pop(meta_key, None)
+
+		if model_override is not None:
+			config['model'] = model_override
+
+		model_name = config.pop('model', None) or 'gpt-4o'
+
+		# Treat placeholder or empty API keys as absent so provider defaults/env vars can be used
+		api_key_value = config.get('api_key')
+		if isinstance(api_key_value, str) and (not api_key_value.strip() or 'your-openai-api-key-here' in api_key_value.lower()):
+			config.pop('api_key', None)
+		provider = (config.pop('provider', None) or '').strip().lower()
+		provider_aliases = {
+			'': 'openai',
+			'openai-compatible': 'openai',
+			'openai_compatible': 'openai',
+			'openai-like': 'openai',
+			'openai_like': 'openai',
+			'azure-openai': 'azure',
+			'azureopenai': 'azure',
+			'google-vertex': 'google',
+			'google_vertex': 'google',
+			'google-vertex-anthropic': 'anthropic',
+			'aws_bedrock': 'aws-bedrock',
+		}
+		provider = provider_aliases.get(provider, provider or self._infer_llm_provider(model_name))
+
+		if provider == 'openai' and 'api_key' not in config and not os.getenv('OPENAI_API_KEY'):
+			inferred_provider = self._infer_llm_provider(model_name)
+			if inferred_provider != 'openai':
+				provider = inferred_provider
+			elif os.getenv('MISTRAL_API_KEY'):
+				provider = 'mistral'
+			elif os.getenv('ANTHROPIC_API_KEY'):
+				provider = 'anthropic'
+			elif os.getenv('GOOGLE_API_KEY'):
+				provider = 'google'
+			elif os.getenv('DEEPSEEK_API_KEY'):
+				provider = 'deepseek'
+			elif os.getenv('GROQ_API_KEY'):
+				provider = 'groq'
+			elif os.getenv('NOVITA_API_KEY'):
+				provider = 'openrouter'
+
+		if provider == 'azure':
+			from browser_use.llm.azure.chat import ChatAzureOpenAI
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatAzureOpenAI)
+			temp = config.get('temperature')
+			if 'temperature' in config:
+				kwargs['temperature'] = temp
+			else:
+				kwargs.setdefault('temperature', 0.7)
+			if config.get('max_tokens') is not None:
+				kwargs['max_completion_tokens'] = config['max_tokens']
+			return ChatAzureOpenAI(model=model_name, **kwargs)
+
+		if provider == 'anthropic':
+			from browser_use.llm import ChatAnthropic
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatAnthropic)
+			if 'temperature' in config:
+				kwargs['temperature'] = config.get('temperature')
+			if config.get('max_tokens') is not None and 'max_tokens' not in kwargs:
+				kwargs['max_tokens'] = config['max_tokens']
+			if 'api_key' not in kwargs and config.get('api_key'):
+				kwargs['api_key'] = config['api_key']
+			return ChatAnthropic(model=model_name, **kwargs)
+
+		if provider == 'google':
+			from browser_use.llm import ChatGoogle
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatGoogle)
+			if 'temperature' in config:
+				kwargs['temperature'] = config.get('temperature')
+			return ChatGoogle(model=model_name, **kwargs)
+
+		if provider == 'mistral':
+			from browser_use.llm.chat_mistral import ChatMistral
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatOpenAI)
+			if 'temperature' in config:
+				kwargs['temperature'] = config.get('temperature')
+			else:
+				kwargs.setdefault('temperature', 0.7)
+			if config.get('max_tokens') is not None:
+				kwargs['max_tokens'] = config['max_tokens']
+			if config.get('base_url') is not None:
+				kwargs['base_url'] = config['base_url']
+			if config.get('api_key'):
+				kwargs['api_key'] = config['api_key']
+			return ChatMistral(model=model_name, **kwargs)
+
+		if provider == 'groq':
+			from browser_use.llm.groq.chat import ChatGroq
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatGroq)
+			return ChatGroq(model=model_name, **kwargs)
+
+		if provider == 'deepseek':
+			from browser_use.llm.deepseek.chat import ChatDeepSeek
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatDeepSeek)
+			return ChatDeepSeek(model=model_name, **kwargs)
+
+		if provider == 'openrouter':
+			from browser_use.llm.openrouter.chat import ChatOpenRouter
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatOpenRouter)
+			return ChatOpenRouter(model=model_name, **kwargs)
+
+		if provider == 'ollama':
+			from browser_use.llm.ollama.chat import ChatOllama
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatOllama)
+			return ChatOllama(model=model_name, **kwargs)
+
+		if provider == 'aws-bedrock':
+			from browser_use.llm.aws.chat_bedrock import ChatAWSBedrock
+
+			kwargs = self._filter_dataclass_kwargs(config, ChatAWSBedrock)
+			if config.get('max_tokens') is not None and 'max_tokens' not in kwargs:
+				kwargs['max_tokens'] = config['max_tokens']
+			return ChatAWSBedrock(model=model_name, **kwargs)
+
+		# Default to OpenAI-compatible models
+		kwargs = self._filter_dataclass_kwargs(config, ChatOpenAI)
+		temp = config.get('temperature')
+		if 'temperature' in config:
+			kwargs['temperature'] = temp
+		else:
+			kwargs.setdefault('temperature', 0.7)
+		api_key = kwargs.get('api_key') or config.get('api_key') or os.getenv('OPENAI_API_KEY')
+		if not api_key:
+			raise ValueError('OPENAI_API_KEY not set in config or environment')
+		kwargs['api_key'] = api_key
+		if config.get('max_tokens') is not None:
+			kwargs['max_completion_tokens'] = config['max_tokens']
+		return ChatOpenAI(model=model_name, **kwargs)
+
 	async def _init_browser_session(self, allowed_domains: list[str] | None = None, **kwargs):
 		"""Initialize browser session using config"""
 		if self.browser_session:
@@ -511,17 +736,20 @@ class BrowserUseServer:
 		# Ensure all logging goes to stderr before browser initialization
 		_ensure_all_loggers_use_stderr()
 
+		self._record_diag('init_browser_session:start')
 		logger.debug('Initializing browser session...')
 
 		# Get profile config
 		profile_config = get_default_profile(self.config)
+
+		session_settings = self.config.get('session', {})
+		use_ephemeral_sessions = session_settings.get('ephemeral_sessions', False)
 
 		# Merge profile config with defaults and overrides
 		profile_data = {
 			'downloads_path': str(Path.home() / 'Downloads' / 'browser-use-mcp'),
 			'wait_between_actions': 0.5,
 			'keep_alive': True,
-			'user_data_dir': '~/.config/browseruse/profiles/default',
 			'device_scale_factor': 1.0,
 			'disable_security': False,
 			'headless': False,
@@ -536,40 +764,63 @@ class BrowserUseServer:
 		for key, value in kwargs.items():
 			profile_data[key] = value
 
+		# Create per-session ephemeral user data directory when not explicitly provided
+		temp_user_data_dir: str | None = None
+		if profile_data.get('user_data_dir'):
+			profile_data['user_data_dir'] = str(Path(profile_data['user_data_dir']).expanduser())
+		elif use_ephemeral_sessions:
+			temp_user_data_dir = tempfile.mkdtemp(prefix='browser-use-mcp-')
+			profile_data['user_data_dir'] = temp_user_data_dir
+		else:
+			default_profile_path = str(Path('~/.config/browseruse/profiles/default').expanduser())
+			profile_data['user_data_dir'] = default_profile_path
+
 		# Create browser profile
 		profile = BrowserProfile(**profile_data)
 
-		# Create browser session
-		self.browser_session = BrowserSession(browser_profile=profile)
-		await self.browser_session.start()
+		# Create browser session (only assign after successful start)
+		session = BrowserSession(browser_profile=profile)
+		self._record_diag(f'init_browser_session:profile_ready allowed={profile.allowed_domains}')
+		try:
+			await session.start()
+			self._record_diag('init_browser_session:browser_started')
+		except Exception as e:
+			self._record_diag(f'init_browser_session:error {type(e).__name__}: {e}')
+			if temp_user_data_dir:
+				shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+			raise
+
+		self.browser_session = session
 
 		# Track the session for management
-		self._track_session(self.browser_session)
+		self._track_session(self.browser_session, temp_user_data_dir, bool(temp_user_data_dir))
 
 		# Create tools for direct actions
 		self.tools = Tools()
 
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
-		if api_key := llm_config.get('api_key'):
-			self.llm = ChatOpenAI(
-				model=llm_config.get('model', 'gpt-4o-mini'),
-				api_key=api_key,
-				temperature=llm_config.get('temperature', 0.7),
-				# max_tokens=llm_config.get('max_tokens'),
-			)
+		try:
+			self.llm = self._create_llm_from_config(llm_config)
+		except ValueError as e:
+			logger.debug(f'LLM not initialized: {e}')
+			self.llm = None
+		except Exception as e:
+			logger.error(f'Failed to initialize LLM: {e}', exc_info=True)
+			self.llm = None
 
 		# Initialize FileSystem for extraction actions
 		file_system_path = profile_config.get('file_system_path', '~/.browser-use-mcp')
 		self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
 		logger.debug('Browser session initialized')
+		self._record_diag('init_browser_session:complete')
 
 	async def _retry_with_browser_use_agent(
 		self,
 		task: str,
 		max_steps: int = 100,
-		model: str = 'gpt-4o',
+		model: str | None = None,
 		allowed_domains: list[str] | None = None,
 		use_vision: bool = True,
 	) -> str:
@@ -578,21 +829,17 @@ class BrowserUseServer:
 
 		# Get LLM config
 		llm_config = get_default_llm(self.config)
-		api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
-		if not api_key:
-			return 'Error: OPENAI_API_KEY not set in config or environment'
+		config_override = dict(llm_config)
+		if model is not None:
+			config_override['model'] = model
 
-		# Override model if provided in tool call
-		if model != llm_config.get('model', 'gpt-4o'):
-			llm_model = model
-		else:
-			llm_model = llm_config.get('model', 'gpt-4o')
-
-		llm = ChatOpenAI(
-			model=llm_model,
-			api_key=api_key,
-			temperature=llm_config.get('temperature', 0.7),
-		)
+		try:
+			llm = self._create_llm_from_config(config_override)
+		except ValueError as e:
+			return f'Error: {e}'
+		except Exception as e:
+			logger.error(f'Failed to initialize LLM for retry_with_browser_use_agent: {e}', exc_info=True)
+			return f'Error: Failed to initialize LLM: {e}'
 
 		# Get profile config and merge with tool parameters
 		profile_config = get_default_profile(self.config)
@@ -647,6 +894,159 @@ class BrowserUseServer:
 			# Clean up
 			await agent.close()
 
+	@staticmethod
+	def _is_placeholder_url(url: str | None) -> bool:
+		"""Determine whether a URL is a browser placeholder (about:blank, chrome://, etc.)."""
+		if not url:
+			return True
+		lowered = url.lower()
+		return any(lowered.startswith(prefix) for prefix in PLACEHOLDER_URL_PREFIXES)
+
+	@staticmethod
+	def _urls_equivalent(left: str, right: str) -> bool:
+		"""Compare URLs ignoring trailing slashes and common subdomain differences."""
+		try:
+			left_parts = urlsplit(left)
+			right_parts = urlsplit(right)
+		except ValueError:
+			return left.rstrip('/') == right.rstrip('/')
+
+		def _normalize(parts):
+			netloc = parts.netloc.lower()
+			if netloc.startswith('www.'):
+				netloc = netloc[4:]
+			path = parts.path.rstrip('/') or '/'
+			return (netloc, path, parts.query)
+
+		return _normalize(left_parts) == _normalize(right_parts)
+
+	def _get_recent_meaningful_navigation_url(self) -> str | None:
+		"""Return the most recent HTTP(S) navigation URL from the event history."""
+		if not self.browser_session:
+			return None
+
+		try:
+			events = sorted(
+				self.browser_session.event_bus.event_history.values(),
+				key=lambda event: event.event_created_at.timestamp(),
+				reverse=True,
+			)
+		except Exception:
+			return None
+
+		for event in events:
+			url = getattr(event, 'url', None)
+			if not url or self._is_placeholder_url(url):
+				continue
+			if url.lower().startswith(('http://', 'https://')):
+				self._record_diag(f'ensure_state:recent_nav url={url}')
+				return url
+
+		self._record_diag('ensure_state:recent_nav_none')
+		return None
+
+	def _remember_session_url(self, url: str) -> None:
+		"""Cache the most recent meaningful URL for the active session."""
+		if not self.browser_session or not url:
+			return
+
+		try:
+			self.browser_session._last_navigation_url = url
+		except Exception:
+			pass
+		self._record_diag(f'ensure_state:remember_url url={url}')
+
+		session_info = self.active_sessions.get(self.browser_session.id)
+		if session_info is not None:
+			session_info['url'] = url
+
+	async def _ensure_meaningful_state(
+		self,
+		*,
+		include_screenshot: bool = False,
+		cache_clickable_elements_hashes: bool = False,
+		expected_url: str | None = None,
+		max_attempts: int = 8,
+		base_delay: float = 0.5,
+		total_timeout: float | None = 12.0,
+	):
+		"""Fetch browser state, retrying until the page is no longer a placeholder."""
+		if not self.browser_session:
+			self._record_diag('ensure_state:abort_no_session')
+			return None
+
+		self._record_diag(
+			f'ensure_state:start expected={expected_url} include_screenshot={include_screenshot} timeout={total_timeout}'
+		)
+
+		last_state = None
+		candidate_expected = expected_url or getattr(self.browser_session, '_last_navigation_url', None)
+		if candidate_expected and self._is_placeholder_url(candidate_expected):
+			candidate_expected = None
+		meaningful_expected = candidate_expected or self._get_recent_meaningful_navigation_url()
+		deadline = None
+		if total_timeout is not None and total_timeout > 0:
+			deadline = time.monotonic() + total_timeout
+
+		for attempt in range(max_attempts):
+			if deadline is not None and time.monotonic() >= deadline:
+				self._record_diag(f'ensure_state:deadline_reached attempt={attempt}')
+				break
+			state = await self.browser_session.get_browser_state_summary(
+				cache_clickable_elements_hashes=cache_clickable_elements_hashes,
+				include_screenshot=include_screenshot,
+				cached=False,
+			)
+			last_state = state
+			state_url = getattr(state, 'url', None)
+			placeholder = self._is_placeholder_url(state_url)
+			tabs_count = len(getattr(state, 'tabs', []) or [])
+			has_dom = bool(getattr(state, 'dom_state', None) and getattr(state.dom_state, 'selector_map', {}))
+			self._record_diag(
+				f'ensure_state:attempt={attempt} url={state_url} placeholder={placeholder} tabs={tabs_count} dom={has_dom}'
+			)
+
+			if state.url and not self._is_placeholder_url(state.url):
+				self._remember_session_url(state.url)
+				self._record_diag(f'ensure_state:success url={state.url}')
+				return state
+
+			if meaningful_expected and state.url and self._urls_equivalent(state.url, meaningful_expected):
+				self._remember_session_url(state.url)
+				self._record_diag(f'ensure_state:success_equivalent url={state.url}')
+				return state
+
+			if meaningful_expected:
+				for tab in state.tabs:
+					tab_url = getattr(tab, 'url', None)
+					if tab_url and not self._is_placeholder_url(tab_url):
+						if self._urls_equivalent(tab_url, meaningful_expected):
+							self._remember_session_url(tab_url)
+							self._record_diag(f'ensure_state:success_tab url={tab_url}')
+							return state
+
+			if state.dom_state and getattr(state.dom_state, 'selector_map', {}):
+				# Consider the state meaningful if we have interactive elements, even if URL is delayed.
+				if meaningful_expected:
+					self._remember_session_url(meaningful_expected)
+				self._record_diag('ensure_state:success_dom_only')
+				return state
+
+			if attempt < max_attempts - 1:
+				delay = base_delay * (2 ** attempt)
+				if deadline is not None:
+					remaining = deadline - time.monotonic()
+					if remaining <= 0:
+						self._record_diag(f'ensure_state:deadline_pre_sleep attempt={attempt}')
+						break
+					delay = min(delay, remaining)
+				if delay > 0:
+					self._record_diag(f'ensure_state:sleep delay={delay:.2f}')
+					await asyncio.sleep(delay)
+
+		self._record_diag('ensure_state:return_last_state')
+		return last_state
+
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""
 		if not self.browser_session:
@@ -654,16 +1054,75 @@ class BrowserUseServer:
 
 		# Update session activity
 		self._update_session_activity(self.browser_session.id)
+		self._record_diag(f'navigate:start url={url} new_tab={new_tab}')
 
 		from browser_use.browser.events import NavigateToUrlEvent
+
+		total_wait = (
+			(self.browser_session.browser_profile.minimum_wait_page_load_time or 0.0)
+			+ (self.browser_session.browser_profile.wait_for_network_idle_page_load_time or 0.0)
+			+ 6.0
+		)
+		total_wait = max(total_wait, 8.0)
+		recheck_delay = 0.5
 
 		if new_tab:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
 			await event
+			self._record_diag('navigate:event_completed')
+			await self.browser_session.wait_for_page_idle()
+			self._record_diag('navigate:page_idle_wait_complete')
+			state = await self._ensure_meaningful_state(
+				expected_url=url,
+				cache_clickable_elements_hashes=True,
+				total_timeout=total_wait,
+			)
+			self._record_diag(
+				f'navigate:state_result url={getattr(state, "url", None)} placeholder={self._is_placeholder_url(getattr(state, "url", None)) if state else "n/a"}'
+			)
+			if not state or self._is_placeholder_url(getattr(state, 'url', None)):
+				try:
+					self._record_diag('navigate:schedule_followup_state_task')
+					asyncio.create_task(
+						self._ensure_meaningful_state(
+							expected_url=url,
+							cache_clickable_elements_hashes=True,
+							max_attempts=4,
+							base_delay=recheck_delay,
+							total_timeout=20.0,
+						)
+					)
+				except RuntimeError:
+					pass
 			return f'Opened new tab with URL: {url}'
 		else:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
 			await event
+			self._record_diag('navigate:event_completed')
+			await self.browser_session.wait_for_page_idle()
+			self._record_diag('navigate:page_idle_wait_complete')
+			state = await self._ensure_meaningful_state(
+				expected_url=url,
+				cache_clickable_elements_hashes=True,
+				total_timeout=total_wait,
+			)
+			self._record_diag(
+				f'navigate:state_result url={getattr(state, "url", None)} placeholder={self._is_placeholder_url(getattr(state, "url", None)) if state else "n/a"}'
+			)
+			if not state or self._is_placeholder_url(getattr(state, 'url', None)):
+				try:
+					self._record_diag('navigate:schedule_followup_state_task')
+					asyncio.create_task(
+						self._ensure_meaningful_state(
+							expected_url=url,
+							cache_clickable_elements_hashes=True,
+							max_attempts=4,
+							base_delay=recheck_delay,
+							total_timeout=20.0,
+						)
+					)
+				except RuntimeError:
+					pass
 			return f'Navigated to: {url}'
 
 	async def _click(self, index: int, new_tab: bool = False) -> str:
@@ -737,7 +1196,18 @@ class BrowserUseServer:
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		state = await self.browser_session.get_browser_state_summary(cache_clickable_elements_hashes=False)
+		self._record_diag(f'get_state:start include_screenshot={include_screenshot}')
+		state = await self._ensure_meaningful_state(
+			include_screenshot=include_screenshot,
+			cache_clickable_elements_hashes=False,
+			total_timeout=25.0,
+		)
+		if state is None:
+			self._record_diag('get_state:error_no_state')
+			return 'Error: Failed to retrieve browser state'
+		self._record_diag(
+			f'get_state:success url={state.url} placeholder={self._is_placeholder_url(state.url)} tabs={len(state.tabs)} dom={bool(state.dom_state and state.dom_state.selector_map)}'
+		)
 
 		result = {
 			'url': state.url,
@@ -747,17 +1217,18 @@ class BrowserUseServer:
 		}
 
 		# Add interactive elements with their indices
-		for index, element in state.dom_state.selector_map.items():
-			elem_info = {
-				'index': index,
-				'tag': element.tag_name,
-				'text': element.get_all_children_text(max_depth=2)[:100],
-			}
-			if element.attributes.get('placeholder'):
-				elem_info['placeholder'] = element.attributes['placeholder']
-			if element.attributes.get('href'):
-				elem_info['href'] = element.attributes['href']
-			result['interactive_elements'].append(elem_info)
+		if state.dom_state and state.dom_state.selector_map:
+			for index, element in state.dom_state.selector_map.items():
+				elem_info = {
+					'index': index,
+					'tag': element.tag_name,
+					'text': element.get_all_children_text(max_depth=2)[:100],
+				}
+				if element.attributes.get('placeholder'):
+					elem_info['placeholder'] = element.attributes['placeholder']
+				if element.attributes.get('href'):
+					elem_info['href'] = element.attributes['href']
+				result['interactive_elements'].append(elem_info)
 
 		if include_screenshot and state.screenshot:
 			result['screenshot'] = state.screenshot
@@ -832,13 +1303,7 @@ class BrowserUseServer:
 	async def _close_browser(self) -> str:
 		"""Close the browser session."""
 		if self.browser_session:
-			from browser_use.browser.events import BrowserStopEvent
-
-			event = self.browser_session.event_bus.dispatch(BrowserStopEvent())
-			await event
-			self.browser_session = None
-			self.tools = None
-			return 'Browser closed'
+			return await self._close_session(self.browser_session.id)
 		return 'No browser session to close'
 
 	async def _list_tabs(self) -> str:
@@ -878,13 +1343,20 @@ class BrowserUseServer:
 		current_url = await self.browser_session.get_current_page_url()
 		return f'Closed tab # {tab_id}, now on {current_url}'
 
-	def _track_session(self, session: BrowserSession) -> None:
+	def _track_session(
+		self,
+		session: BrowserSession,
+		user_data_dir: str | None = None,
+		ephemeral_user_data: bool = False,
+	) -> None:
 		"""Track a browser session for management."""
 		self.active_sessions[session.id] = {
 			'session': session,
 			'created_at': time.time(),
 			'last_activity': time.time(),
 			'url': getattr(session, 'current_url', None),
+			'user_data_dir': user_data_dir,
+			'ephemeral_user_data': ephemeral_user_data,
 		}
 
 	def _update_session_activity(self, session_id: str) -> None:
@@ -934,8 +1406,8 @@ class BrowserUseServer:
 			elif hasattr(session, 'close'):
 				await session.close()
 
-			# Remove from tracking
-			del self.active_sessions[session_id]
+			session_info = self.active_sessions.pop(session_id, None)
+			self._cleanup_session_resources(session_id, session_info)
 
 			# If this was the current session, clear it
 			if self.browser_session and self.browser_session.id == session_id:
@@ -945,6 +1417,22 @@ class BrowserUseServer:
 			return f'Successfully closed session {session_id}'
 		except Exception as e:
 			return f'Error closing session {session_id}: {str(e)}'
+
+	def _cleanup_session_resources(
+		self,
+		session_id: str,
+		session_info: dict[str, Any] | None = None,
+	) -> None:
+		"""Remove temporary resources associated with a session."""
+		info = session_info or self.active_sessions.get(session_id)
+		if not info:
+			return
+		temp_dir = info.get('user_data_dir')
+		if info.get('ephemeral_user_data') and temp_dir:
+			try:
+				shutil.rmtree(temp_dir, ignore_errors=True)
+			except Exception:
+				pass
 
 	async def _close_all_sessions(self) -> str:
 		"""Close all active browser sessions."""
